@@ -2,10 +2,13 @@ import os
 import re
 import time
 import math
+import html
+import smtplib
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from email.message import EmailMessage
 
 import requests
 
@@ -29,12 +32,44 @@ VARAS_ALVO = [
     "4ª Vara do Trabalho de Mogi das Cruzes",
 ]
 
-# Número de páginas consultadas simultaneamente.
-# 5 mantém boa velocidade e tende a reduzir os alertas HTTP 429.
+# Mantemos 5 para equilibrar velocidade e reduzir HTTP 429.
 MAX_WORKERS = 5
-
-# Quantidade máxima de tentativas para uma mesma página.
 MAX_TENTATIVAS = 8
+
+
+# ============================================================
+# E-MAIL
+# ============================================================
+#
+# Configure estes Secrets no GitHub:
+#
+# SMTP_HOST
+# SMTP_PORT
+# SMTP_USUARIO
+# SMTP_SENHA
+# EMAIL_DESTINATARIO
+#
+# Opcional:
+# EMAIL_REMETENTE
+#
+# Exemplos:
+# Gmail:
+#   SMTP_HOST = smtp.gmail.com
+#   SMTP_PORT = 587
+#
+# Outlook / Microsoft:
+#   SMTP_HOST = smtp.office365.com
+#   SMTP_PORT = 587
+#
+# EMAIL_REMETENTE, se não informado, será igual a SMTP_USUARIO.
+#
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USUARIO = os.getenv("SMTP_USUARIO", "")
+SMTP_SENHA = os.getenv("SMTP_SENHA", "")
+EMAIL_DESTINATARIO = os.getenv("EMAIL_DESTINATARIO", "")
+EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE", SMTP_USUARIO)
 
 
 # ============================================================
@@ -42,13 +77,6 @@ MAX_TENTATIVAS = 8
 # ============================================================
 
 def normalizar(texto):
-    """
-    Converte para minúsculas, remove acentos e padroniza espaços.
-
-    Exemplos:
-        "DISTRIBUÍDO" -> "distribuido"
-        "1ª Vara do Trabalho" -> "1 vara do trabalho"
-    """
     if texto is None:
         return ""
 
@@ -76,10 +104,6 @@ TIPO_COMUNICACAO_ALVO = normalizar("Lista de distribuição")
 
 
 def obter_numero_processo(item):
-    """
-    Tenta localizar o número do processo mesmo que a API varie
-    levemente o nome do campo.
-    """
     return (
         item.get("numeroProcesso")
         or item.get("numeroprocessocommascara")
@@ -97,31 +121,11 @@ def obter_data(item):
 
 
 def contem_palavra_distribuido(texto):
-    """
-    Procura a PALAVRA INTEIRA 'distribuido'.
-
-    Assim:
-        DISTRIBUÍDO   -> aceita
-        Distribuído   -> aceita
-        distribuido   -> aceita
-
-        DISTRIBUIDORA -> NÃO aceita
-        distribuidor  -> NÃO aceita
-    """
     texto_normalizado = normalizar(texto)
-
-    return bool(
-        re.search(r"\bdistribuido\b", texto_normalizado)
-    )
+    return bool(re.search(r"\bdistribuido\b", texto_normalizado))
 
 
 def item_eh_compativel(item):
-    """
-    Retorna True apenas quando:
-    1. pertence a uma das 4 Varas do Trabalho de Mogi das Cruzes;
-    2. tipoComunicacao é exatamente "Lista de distribuição"; e
-    3. o teor contém a palavra inteira DISTRIBUÍDO.
-    """
     orgao = normalizar(item.get("nomeOrgao"))
     tipo_comunicacao = normalizar(item.get("tipoComunicacao"))
 
@@ -141,23 +145,122 @@ def item_eh_compativel(item):
 
 def chave_unica(item):
     """
-    Evita duplicidade da mesma comunicação.
+    Evita duplicidade sem usar somente o link, porque várias distribuições
+    podem compartilhar o mesmo link.
     """
-    hash_publicacao = item.get("hash")
-    if hash_publicacao:
-        return ("hash", str(hash_publicacao))
-
-    link = item.get("link")
-    if link:
-        return ("link", str(link), obter_numero_processo(item))
-
     return (
-        "fallback",
         obter_numero_processo(item),
-        item.get("nomeOrgao", ""),
+        normalizar(item.get("nomeOrgao", "")),
         obter_data(item),
         normalizar(item.get("texto", "")),
     )
+
+
+def formatar_valor(valor):
+    """
+    Converte valores simples, listas e dicionários em texto legível.
+    """
+    if valor is None:
+        return ""
+
+    if isinstance(valor, str):
+        return valor.strip()
+
+    if isinstance(valor, (int, float, bool)):
+        return str(valor)
+
+    if isinstance(valor, list):
+        partes = []
+        for item in valor:
+            texto = formatar_valor(item)
+            if texto:
+                partes.append(texto)
+        return "; ".join(partes)
+
+    if isinstance(valor, dict):
+        partes = []
+        for chave, conteudo in valor.items():
+            texto = formatar_valor(conteudo)
+            if texto:
+                partes.append(f"{chave}: {texto}")
+        return "; ".join(partes)
+
+    return str(valor)
+
+
+def procurar_campos(item, palavras_chave):
+    """
+    Procura valores em campos cujo nome contenha uma das palavras-chave.
+    Serve para aproveitar pequenas variações do JSON da API sem quebrar
+    o monitor.
+    """
+    encontrados = []
+
+    def visitar(obj):
+        if isinstance(obj, dict):
+            for chave, valor in obj.items():
+                chave_norm = normalizar(chave)
+
+                if any(
+                    palavra in chave_norm
+                    for palavra in palavras_chave
+                ):
+                    texto = formatar_valor(valor)
+                    if texto and texto not in encontrados:
+                        encontrados.append(texto)
+
+                if isinstance(valor, (dict, list)):
+                    visitar(valor)
+
+        elif isinstance(obj, list):
+            for valor in obj:
+                visitar(valor)
+
+    visitar(item)
+    return encontrados
+
+
+def obter_meio(item):
+    for chave in (
+        "meio",
+        "meioComunicacao",
+        "meio_comunicacao",
+    ):
+        valor = item.get(chave)
+        texto = formatar_valor(valor)
+        if texto:
+            return texto
+
+    candidatos = procurar_campos(
+        item,
+        ["meio"]
+    )
+
+    return candidatos[0] if candidatos else "Não informado pela API"
+
+
+def obter_partes(item):
+    candidatos = procurar_campos(
+        item,
+        ["parte", "destinatario"]
+    )
+
+    # Evita mostrar campos evidentemente ligados a advogado nesta seção.
+    filtrados = [
+        valor for valor in candidatos
+        if "advog" not in normalizar(valor)
+    ]
+
+    return filtrados if filtrados else ["Não informado pela API"]
+
+
+def obter_advogados(item):
+    candidatos = procurar_campos(
+        item,
+        ["advog"]
+    )
+
+    return candidatos if candidatos else ["Não informado pela API"]
 
 
 # ============================================================
@@ -165,9 +268,6 @@ def chave_unica(item):
 # ============================================================
 
 def fazer_requisicao(parametros):
-    """
-    Faz uma requisição e tenta novamente quando houver falha temporária.
-    """
     ultimo_erro = None
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
@@ -246,9 +346,6 @@ def fazer_requisicao(parametros):
 
 
 def consultar_pagina(pagina, hoje):
-    """
-    Consulta uma página específica.
-    """
     parametros = {
         "siglaTribunal": TRIBUNAL,
         "dataDisponibilizacaoInicio": hoje,
@@ -258,7 +355,6 @@ def consultar_pagina(pagina, hoje):
     }
 
     dados = fazer_requisicao(parametros)
-
     itens = dados.get("items", [])
 
     if not isinstance(itens, list):
@@ -298,12 +394,11 @@ def consultar_publicacoes():
     except (TypeError, ValueError):
         total_registros = 0
 
-    if total_registros > 0:
-        total_paginas = math.ceil(
-            total_registros / ITENS_POR_PAGINA
-        )
-    else:
-        total_paginas = 1
+    total_paginas = (
+        math.ceil(total_registros / ITENS_POR_PAGINA)
+        if total_registros > 0
+        else 1
+    )
 
     print(f"Total informado pela API: {total_registros}")
     print(f"Total estimado de páginas: {total_paginas}")
@@ -377,7 +472,6 @@ def consultar_publicacoes():
     unicos = {}
     for item in resultados:
         chave = chave_unica(item)
-
         if chave not in unicos:
             unicos[chave] = item
 
@@ -400,11 +494,11 @@ def consultar_publicacoes():
         f"{len(publicacoes_unicas)}"
     )
 
-    return publicacoes_unicas
+    return publicacoes_unicas, hoje
 
 
 # ============================================================
-# EXIBIÇÃO FINAL
+# EXIBIÇÃO NO LOG
 # ============================================================
 
 def exibir_resultados(publicacoes):
@@ -426,10 +520,10 @@ def exibir_resultados(publicacoes):
         processo = obter_numero_processo(item)
         orgao = item.get("nomeOrgao", "Não informado")
         data = obter_data(item)
-        tipo = item.get(
-            "tipoComunicacao",
-            "Não informado",
-        )
+        tipo = item.get("tipoComunicacao", "Não informado")
+        meio = obter_meio(item)
+        partes = obter_partes(item)
+        advogados = obter_advogados(item)
         link = item.get("link", "")
         texto = item.get("texto", "")
 
@@ -438,14 +532,213 @@ def exibir_resultados(publicacoes):
         print(f"Órgão: {orgao}")
         print(f"Data de disponibilização: {data}")
         print(f"Tipo de comunicação: {tipo}")
+        print(f"Meio: {meio}")
+        print(f"Parte(s): {' | '.join(partes)}")
+        print(f"Advogado(s): {' | '.join(advogados)}")
 
         if link:
             print(f"Link: {link}")
 
         print("-" * 70)
-        print("Teor:")
+        print("Conteúdo:")
         print(texto)
         print("=" * 70)
+
+
+# ============================================================
+# MONTAGEM DO E-MAIL
+# ============================================================
+
+def limpar_html_para_texto(texto):
+    texto = texto or ""
+    texto = re.sub(r"<br\s*/?>", "\n", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"<[^>]+>", "", texto)
+    return html.unescape(texto).strip()
+
+
+def criar_corpo_texto(publicacoes, hoje):
+    linhas = [
+        f"Monitor TRT2 - Lista de distribuição - {hoje}",
+        "",
+        f"Total de publicações encontradas: {len(publicacoes)}",
+        "",
+    ]
+
+    if not publicacoes:
+        linhas.append(
+            "Nenhuma publicação correspondente aos filtros foi encontrada."
+        )
+        return "\n".join(linhas)
+
+    for indice, item in enumerate(publicacoes, start=1):
+        processo = obter_numero_processo(item)
+        orgao = item.get("nomeOrgao", "Não informado")
+        data = obter_data(item)
+        tipo = item.get("tipoComunicacao", "Não informado")
+        meio = obter_meio(item)
+        partes = obter_partes(item)
+        advogados = obter_advogados(item)
+        link = item.get("link", "")
+        conteudo = limpar_html_para_texto(item.get("texto", ""))
+
+        linhas.extend([
+            "=" * 70,
+            f"{indice}. Processo: {processo}",
+            f"Órgão: {orgao}",
+            f"Data de disponibilização: {data}",
+            f"Tipo de comunicação: {tipo}",
+            f"Meio: {meio}",
+            f"Parte(s): {' | '.join(partes)}",
+            f"Advogado(s): {' | '.join(advogados)}",
+        ])
+
+        if link:
+            linhas.append(f"Link: {link}")
+
+        linhas.extend([
+            "",
+            "Conteúdo:",
+            conteudo,
+            "",
+        ])
+
+    return "\n".join(linhas)
+
+
+def criar_corpo_html(publicacoes, hoje):
+    blocos = []
+
+    if not publicacoes:
+        blocos.append(
+            "<p>Nenhuma publicação correspondente aos filtros foi encontrada.</p>"
+        )
+    else:
+        for indice, item in enumerate(publicacoes, start=1):
+            processo = html.escape(obter_numero_processo(item))
+            orgao = html.escape(
+                str(item.get("nomeOrgao", "Não informado"))
+            )
+            data = html.escape(obter_data(item))
+            tipo = html.escape(
+                str(item.get("tipoComunicacao", "Não informado"))
+            )
+            meio = html.escape(obter_meio(item))
+            partes = "<br>".join(
+                html.escape(valor) for valor in obter_partes(item)
+            )
+            advogados = "<br>".join(
+                html.escape(valor) for valor in obter_advogados(item)
+            )
+            link = item.get("link", "")
+            conteudo = html.escape(
+                limpar_html_para_texto(item.get("texto", ""))
+            ).replace("\n", "<br>")
+
+            link_html = ""
+            if link:
+                link_seguro = html.escape(str(link), quote=True)
+                link_html = (
+                    f'<p><strong>Link:</strong> '
+                    f'<a href="{link_seguro}">{link_seguro}</a></p>'
+                )
+
+            blocos.append(f"""
+            <div style="margin: 0 0 28px 0; padding: 18px; border: 1px solid #d9d9d9; border-radius: 8px;">
+                <p style="margin-top:0;"><strong>{indice}. Processo:</strong> {processo}</p>
+                <p><strong>Órgão:</strong> {orgao}</p>
+                <p><strong>Data de disponibilização:</strong> {data}</p>
+                <p><strong>Tipo de comunicação:</strong> {tipo}</p>
+                <p><strong>Meio:</strong> {meio}</p>
+                <p><strong>Parte(s):</strong><br>{partes}</p>
+                <p><strong>Advogado(s):</strong><br>{advogados}</p>
+                {link_html}
+                <p><strong>Conteúdo:</strong><br>{conteudo}</p>
+            </div>
+            """)
+
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color: #222;">
+        <h2>Monitor TRT2 - Lista de distribuição</h2>
+        <p><strong>Data da consulta:</strong> {html.escape(hoje)}</p>
+        <p><strong>Total de publicações:</strong> {len(publicacoes)}</p>
+        {''.join(blocos)}
+      </body>
+    </html>
+    """
+
+
+# ============================================================
+# ENVIO DO E-MAIL
+# ============================================================
+
+def validar_configuracao_email():
+    faltando = []
+
+    configuracoes = {
+        "SMTP_HOST": SMTP_HOST,
+        "SMTP_USUARIO": SMTP_USUARIO,
+        "SMTP_SENHA": SMTP_SENHA,
+        "EMAIL_DESTINATARIO": EMAIL_DESTINATARIO,
+        "EMAIL_REMETENTE": EMAIL_REMETENTE,
+    }
+
+    for nome, valor in configuracoes.items():
+        if not valor:
+            faltando.append(nome)
+
+    if faltando:
+        raise RuntimeError(
+            "Configuração de e-mail incompleta. "
+            "Secrets ausentes: " + ", ".join(faltando)
+        )
+
+
+def enviar_email(publicacoes, hoje):
+    validar_configuracao_email()
+
+    quantidade = len(publicacoes)
+
+    assunto = (
+        f"Monitor TRT2 - {quantidade} "
+        f"{'distribuição' if quantidade == 1 else 'distribuições'} "
+        f"- {hoje}"
+    )
+
+    mensagem = EmailMessage()
+    mensagem["Subject"] = assunto
+    mensagem["From"] = EMAIL_REMETENTE
+    mensagem["To"] = EMAIL_DESTINATARIO
+
+    mensagem.set_content(
+        criar_corpo_texto(publicacoes, hoje)
+    )
+
+    mensagem.add_alternative(
+        criar_corpo_html(publicacoes, hoje),
+        subtype="html",
+    )
+
+    print()
+    print("Enviando e-mail...")
+
+    with smtplib.SMTP(
+        SMTP_HOST,
+        SMTP_PORT,
+        timeout=60,
+    ) as servidor:
+        servidor.ehlo()
+        servidor.starttls()
+        servidor.ehlo()
+        servidor.login(
+            SMTP_USUARIO,
+            SMTP_SENHA,
+        )
+        servidor.send_message(mensagem)
+
+    print(
+        f"✅ E-mail enviado para {EMAIL_DESTINATARIO}"
+    )
 
 
 # ============================================================
@@ -454,8 +747,9 @@ def exibir_resultados(publicacoes):
 
 if __name__ == "__main__":
     try:
-        publicacoes = consultar_publicacoes()
+        publicacoes, hoje = consultar_publicacoes()
         exibir_resultados(publicacoes)
+        enviar_email(publicacoes, hoje)
 
     except Exception as erro:
         print()
@@ -464,5 +758,4 @@ if __name__ == "__main__":
         print("=" * 70)
         print(str(erro))
         print("=" * 70)
-
         raise
