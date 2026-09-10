@@ -30,8 +30,8 @@ VARAS_ALVO = [
 ]
 
 # Número de páginas consultadas simultaneamente.
-# 8 costuma acelerar bastante sem exagerar na quantidade de requisições.
-MAX_WORKERS = 8
+# 5 mantém boa velocidade e tende a reduzir os alertas HTTP 429.
+MAX_WORKERS = 5
 
 # Quantidade máxima de tentativas para uma mesma página.
 MAX_TENTATIVAS = 8
@@ -71,6 +71,8 @@ def normalizar(texto):
 VARAS_ALVO_NORMALIZADAS = [
     normalizar(vara) for vara in VARAS_ALVO
 ]
+
+TIPO_COMUNICACAO_ALVO = normalizar("Lista de distribuição")
 
 
 def obter_numero_processo(item):
@@ -116,10 +118,12 @@ def contem_palavra_distribuido(texto):
 def item_eh_compativel(item):
     """
     Retorna True apenas quando:
-    1. pertence a uma das 4 Varas do Trabalho de Mogi das Cruzes; e
-    2. o teor contém a palavra inteira DISTRIBUÍDO.
+    1. pertence a uma das 4 Varas do Trabalho de Mogi das Cruzes;
+    2. tipoComunicacao é exatamente "Lista de distribuição"; e
+    3. o teor contém a palavra inteira DISTRIBUÍDO.
     """
     orgao = normalizar(item.get("nomeOrgao"))
+    tipo_comunicacao = normalizar(item.get("tipoComunicacao"))
 
     vara_compativel = any(
         vara_alvo in orgao
@@ -129,15 +133,15 @@ def item_eh_compativel(item):
     if not vara_compativel:
         return False
 
+    if tipo_comunicacao != TIPO_COMUNICACAO_ALVO:
+        return False
+
     return contem_palavra_distribuido(item.get("texto"))
 
 
 def chave_unica(item):
     """
     Evita duplicidade da mesma comunicação.
-
-    A API pode trazer a mesma publicação mais de uma vez, por exemplo
-    quando existem diferentes intimados/citados.
     """
     hash_publicacao = item.get("hash")
     if hash_publicacao:
@@ -145,7 +149,7 @@ def chave_unica(item):
 
     link = item.get("link")
     if link:
-        return ("link", str(link))
+        return ("link", str(link), obter_numero_processo(item))
 
     return (
         "fallback",
@@ -279,15 +283,11 @@ def consultar_publicacoes():
     print("=" * 70)
     print("MONITOR TRT2")
     print("Varas do Trabalho de Mogi das Cruzes")
-    print("Filtro: palavra inteira 'DISTRIBUÍDO'")
+    print("Filtro: tipo 'Lista de distribuição' + palavra inteira 'DISTRIBUÍDO'")
     print(f"Data da consulta (São Paulo): {hoje}")
     print(f"Consultas simultâneas: {MAX_WORKERS}")
     print("=" * 70)
     print()
-
-    # --------------------------------------------------------
-    # 1. Consulta a primeira página separadamente
-    # --------------------------------------------------------
 
     print("Consultando página 1 para descobrir o total de resultados...")
 
@@ -303,7 +303,6 @@ def consultar_publicacoes():
             total_registros / ITENS_POR_PAGINA
         )
     else:
-        # Se a API não informar count, ao menos processamos a página 1.
         total_paginas = 1
 
     print(f"Total informado pela API: {total_registros}")
@@ -312,7 +311,6 @@ def consultar_publicacoes():
 
     resultados = []
 
-    # Processa página 1.
     for item in itens_primeira:
         if item_eh_compativel(item):
             resultados.append(item)
@@ -321,10 +319,6 @@ def consultar_publicacoes():
         f"Página 1 concluída. "
         f"Compatíveis encontrados: {len(resultados)}"
     )
-
-    # --------------------------------------------------------
-    # 2. Consulta as demais páginas em paralelo
-    # --------------------------------------------------------
 
     if total_paginas > 1:
         print()
@@ -353,13 +347,9 @@ def consultar_publicacoes():
                 pagina = futuros[futuro]
 
                 try:
-                    pagina_retornada, _, itens = futuro.result()
+                    _, _, itens = futuro.result()
 
                 except Exception as erro:
-                    # Uma página que continua falhando depois de todos
-                    # os retries deve derrubar a execução, pois em um
-                    # monitor jurídico não queremos fingir que a consulta
-                    # foi completa.
                     raise RuntimeError(
                         f"Falha definitiva na página {pagina}: {erro}"
                     ) from erro
@@ -370,7 +360,6 @@ def consultar_publicacoes():
 
                 concluidas += 1
 
-                # Mostra progresso sem imprimir 895 blocos enormes.
                 if (
                     concluidas % 25 == 0
                     or concluidas == total_paginas
@@ -385,10 +374,6 @@ def consultar_publicacoes():
                         f"compatíveis brutos: {len(resultados)}"
                     )
 
-    # --------------------------------------------------------
-    # 3. Remove duplicidades
-    # --------------------------------------------------------
-
     unicos = {}
     for item in resultados:
         chave = chave_unica(item)
@@ -398,7 +383,6 @@ def consultar_publicacoes():
 
     publicacoes_unicas = list(unicos.values())
 
-    # Ordena por órgão e número do processo para facilitar leitura.
     publicacoes_unicas.sort(
         key=lambda item: (
             normalizar(item.get("nomeOrgao", "")),
@@ -481,6 +465,4 @@ if __name__ == "__main__":
         print(str(erro))
         print("=" * 70)
 
-        # Mantém o GitHub Actions como erro quando a consulta
-        # não tiver sido concluída corretamente.
         raise
