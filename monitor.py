@@ -3,6 +3,7 @@ import re
 import time
 import math
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -28,13 +29,12 @@ VARAS_ALVO = [
     "4ª Vara do Trabalho de Mogi das Cruzes",
 ]
 
-PALAVRA_ALVO = "DISTRIBUÍDO"
+# Número de páginas consultadas simultaneamente.
+# 8 costuma acelerar bastante sem exagerar na quantidade de requisições.
+MAX_WORKERS = 8
 
-# Quantas vezes tentar novamente quando a API/proxy falhar.
+# Quantidade máxima de tentativas para uma mesma página.
 MAX_TENTATIVAS = 8
-
-# Pequena pausa entre páginas para não bombardear a API.
-PAUSA_ENTRE_PAGINAS = 0.15
 
 
 # ============================================================
@@ -43,10 +43,11 @@ PAUSA_ENTRE_PAGINAS = 0.15
 
 def normalizar(texto):
     """
-    Deixa o texto em minúsculas, sem acentos e com espaços padronizados.
-    Ex.:
-        '1ª Vara do Trabalho' -> '1 vara do trabalho'
-        'DISTRIBUÍDO'         -> 'distribuido'
+    Converte para minúsculas, remove acentos e padroniza espaços.
+
+    Exemplos:
+        "DISTRIBUÍDO" -> "distribuido"
+        "1ª Vara do Trabalho" -> "1 vara do trabalho"
     """
     if texto is None:
         return ""
@@ -63,17 +64,19 @@ def normalizar(texto):
 
     texto = texto.lower()
     texto = re.sub(r"[^a-z0-9]+", " ", texto)
+
     return " ".join(texto.split())
 
 
-VARAS_ALVO_NORMALIZADAS = [normalizar(vara) for vara in VARAS_ALVO]
-PALAVRA_ALVO_NORMALIZADA = normalizar(PALAVRA_ALVO)
+VARAS_ALVO_NORMALIZADAS = [
+    normalizar(vara) for vara in VARAS_ALVO
+]
 
 
 def obter_numero_processo(item):
     """
-    A API já apresentou variações de nomes de campo.
-    Tentamos os formatos mais comuns.
+    Tenta localizar o número do processo mesmo que a API varie
+    levemente o nome do campo.
     """
     return (
         item.get("numeroProcesso")
@@ -83,31 +86,83 @@ def obter_numero_processo(item):
     )
 
 
+def obter_data(item):
+    return (
+        item.get("dataDisponibilizacao")
+        or item.get("datadisponibilizacao")
+        or "Não informada"
+    )
+
+
+def contem_palavra_distribuido(texto):
+    """
+    Procura a PALAVRA INTEIRA 'distribuido'.
+
+    Assim:
+        DISTRIBUÍDO   -> aceita
+        Distribuído   -> aceita
+        distribuido   -> aceita
+
+        DISTRIBUIDORA -> NÃO aceita
+        distribuidor  -> NÃO aceita
+    """
+    texto_normalizado = normalizar(texto)
+
+    return bool(
+        re.search(r"\bdistribuido\b", texto_normalizado)
+    )
+
+
 def item_eh_compativel(item):
     """
-    Retorna True somente quando:
-    1. o órgão é uma das 4 Varas do Trabalho de Mogi das Cruzes; e
-    2. o teor contém a palavra DISTRIBUÍDO.
+    Retorna True apenas quando:
+    1. pertence a uma das 4 Varas do Trabalho de Mogi das Cruzes; e
+    2. o teor contém a palavra inteira DISTRIBUÍDO.
     """
     orgao = normalizar(item.get("nomeOrgao"))
-    texto = normalizar(item.get("texto"))
 
     vara_compativel = any(
         vara_alvo in orgao
         for vara_alvo in VARAS_ALVO_NORMALIZADAS
     )
 
-    distribuido = PALAVRA_ALVO_NORMALIZADA in texto
+    if not vara_compativel:
+        return False
 
-    return vara_compativel and distribuido
+    return contem_palavra_distribuido(item.get("texto"))
 
+
+def chave_unica(item):
+    """
+    Evita duplicidade da mesma comunicação.
+
+    A API pode trazer a mesma publicação mais de uma vez, por exemplo
+    quando existem diferentes intimados/citados.
+    """
+    hash_publicacao = item.get("hash")
+    if hash_publicacao:
+        return ("hash", str(hash_publicacao))
+
+    link = item.get("link")
+    if link:
+        return ("link", str(link))
+
+    return (
+        "fallback",
+        obter_numero_processo(item),
+        item.get("nomeOrgao", ""),
+        obter_data(item),
+        normalizar(item.get("texto", "")),
+    )
+
+
+# ============================================================
+# REQUISIÇÕES COM RETRY
+# ============================================================
 
 def fazer_requisicao(parametros):
     """
-    Faz a requisição com várias tentativas automáticas.
-
-    Erros 500, 502, 503, 504 e 429 são tratados como temporários.
-    O script espera alguns segundos e tenta novamente a MESMA página.
+    Faz uma requisição e tenta novamente quando houver falha temporária.
     """
     ultimo_erro = None
 
@@ -126,24 +181,24 @@ def fazer_requisicao(parametros):
             if resposta.status_code == 403:
                 raise RuntimeError(
                     "Comunica PJe retornou HTTP 403. "
-                    "Verifique se PJE_API_URL está apontando para o proxy "
-                    "brasileiro da Vercel."
+                    "Verifique o Secret PJE_API_URL e o proxy brasileiro."
                 )
 
             if resposta.status_code in (429, 500, 502, 503, 504):
-                espera = min(5 * tentativa, 30)
-
-                print(
-                    f"⚠️ API retornou HTTP {resposta.status_code}. "
-                    f"Tentativa {tentativa}/{MAX_TENTATIVAS}."
-                )
-
                 ultimo_erro = RuntimeError(
-                    f"HTTP {resposta.status_code}: {resposta.text[:300]}"
+                    f"HTTP {resposta.status_code}"
                 )
 
                 if tentativa < MAX_TENTATIVAS:
-                    print(f"Aguardando {espera} segundos e tentando novamente...")
+                    espera = min(3 * tentativa, 20)
+
+                    print(
+                        f"⚠️ Página {parametros.get('pagina')} retornou "
+                        f"HTTP {resposta.status_code}. "
+                        f"Tentativa {tentativa}/{MAX_TENTATIVAS}. "
+                        f"Nova tentativa em {espera}s."
+                    )
+
                     time.sleep(espera)
                     continue
 
@@ -151,9 +206,10 @@ def fazer_requisicao(parametros):
 
             try:
                 return resposta.json()
+
             except ValueError as erro_json:
                 raise RuntimeError(
-                    "A API respondeu, mas o conteúdo não era um JSON válido."
+                    "A API respondeu, mas não retornou JSON válido."
                 ) from erro_json
 
         except (
@@ -161,15 +217,17 @@ def fazer_requisicao(parametros):
             requests.exceptions.ConnectionError,
         ) as erro:
             ultimo_erro = erro
-            espera = min(5 * tentativa, 30)
-
-            print(
-                f"⚠️ Falha de conexão. "
-                f"Tentativa {tentativa}/{MAX_TENTATIVAS}: {erro}"
-            )
 
             if tentativa < MAX_TENTATIVAS:
-                print(f"Aguardando {espera} segundos e tentando novamente...")
+                espera = min(3 * tentativa, 20)
+
+                print(
+                    f"⚠️ Falha de conexão na página "
+                    f"{parametros.get('pagina')}. "
+                    f"Tentativa {tentativa}/{MAX_TENTATIVAS}. "
+                    f"Nova tentativa em {espera}s."
+                )
+
                 time.sleep(espera)
                 continue
 
@@ -178,114 +236,191 @@ def fazer_requisicao(parametros):
             break
 
     raise RuntimeError(
-        f"Não foi possível consultar a API após "
+        f"Página {parametros.get('pagina')} falhou após "
         f"{MAX_TENTATIVAS} tentativas. Último erro: {ultimo_erro}"
     )
 
 
+def consultar_pagina(pagina, hoje):
+    """
+    Consulta uma página específica.
+    """
+    parametros = {
+        "siglaTribunal": TRIBUNAL,
+        "dataDisponibilizacaoInicio": hoje,
+        "dataDisponibilizacaoFim": hoje,
+        "pagina": pagina,
+        "itensPorPagina": ITENS_POR_PAGINA,
+    }
+
+    dados = fazer_requisicao(parametros)
+
+    itens = dados.get("items", [])
+
+    if not isinstance(itens, list):
+        raise RuntimeError(
+            f"Resposta inesperada na página {pagina}: "
+            "o campo 'items' não é uma lista."
+        )
+
+    return pagina, dados, itens
+
+
 # ============================================================
-# CONSULTA
+# CONSULTA PRINCIPAL
 # ============================================================
 
 def consultar_publicacoes():
-    # IMPORTANTE:
-    # GitHub Actions usa UTC. Aqui forçamos o horário de São Paulo.
     hoje = datetime.now(
         ZoneInfo("America/Sao_Paulo")
     ).strftime("%Y-%m-%d")
 
     print()
+    print("=" * 70)
     print("MONITOR TRT2")
     print("Varas do Trabalho de Mogi das Cruzes")
-    print("Filtro: teor contém 'DISTRIBUÍDO'")
+    print("Filtro: palavra inteira 'DISTRIBUÍDO'")
     print(f"Data da consulta (São Paulo): {hoje}")
+    print(f"Consultas simultâneas: {MAX_WORKERS}")
+    print("=" * 70)
     print()
 
-    publicacoes_encontradas = []
+    # --------------------------------------------------------
+    # 1. Consulta a primeira página separadamente
+    # --------------------------------------------------------
 
-    pagina = 1
-    total_registros = None
-    total_paginas = None
+    print("Consultando página 1 para descobrir o total de resultados...")
 
-    while True:
-        print("=" * 70)
-        print(f"Consultando página {pagina}...")
-        print(f"API utilizada: {API_URL}")
-        print("=" * 70)
+    _, dados_primeira, itens_primeira = consultar_pagina(1, hoje)
 
-        parametros = {
-            "siglaTribunal": TRIBUNAL,
-            "dataDisponibilizacaoInicio": hoje,
-            "dataDisponibilizacaoFim": hoje,
-            "pagina": pagina,
-            "itensPorPagina": ITENS_POR_PAGINA,
-        }
+    try:
+        total_registros = int(dados_primeira.get("count", 0))
+    except (TypeError, ValueError):
+        total_registros = 0
 
-        dados = fazer_requisicao(parametros)
-
-        itens = dados.get("items", [])
-        if not isinstance(itens, list):
-            raise RuntimeError(
-                "Resposta inesperada da API: o campo 'items' não é uma lista."
-            )
-
-        print(f"Resultados recebidos nesta página: {len(itens)}")
-
-        # Na primeira página, guardamos o total informado pela API.
-        if total_registros is None:
-            try:
-                total_registros = int(dados.get("count", 0))
-            except (TypeError, ValueError):
-                total_registros = 0
-
-            print(f"Total informado pela API: {total_registros}")
-
-            if total_registros > 0:
-                total_paginas = math.ceil(
-                    total_registros / ITENS_POR_PAGINA
-                )
-                print(f"Total estimado de páginas: {total_paginas}")
-
-        # Aplica os filtros localmente.
-        for item in itens:
-            if item_eh_compativel(item):
-                publicacoes_encontradas.append(item)
-
-                print()
-                print("✅ PUBLICAÇÃO COMPATÍVEL ENCONTRADA")
-                print(f"Processo: {obter_numero_processo(item)}")
-                print(f"Órgão: {item.get('nomeOrgao', 'Não informado')}")
-                print(
-                    "Data: "
-                    f"{item.get('dataDisponibilizacao', item.get('datadisponibilizacao', 'Não informada'))}"
-                )
-                print()
-
-        print(
-            "Publicações compatíveis encontradas até agora: "
-            f"{len(publicacoes_encontradas)}"
+    if total_registros > 0:
+        total_paginas = math.ceil(
+            total_registros / ITENS_POR_PAGINA
         )
+    else:
+        # Se a API não informar count, ao menos processamos a página 1.
+        total_paginas = 1
 
-        # Critérios seguros de encerramento da paginação.
-        if not itens:
-            break
+    print(f"Total informado pela API: {total_registros}")
+    print(f"Total estimado de páginas: {total_paginas}")
+    print()
 
-        if len(itens) < ITENS_POR_PAGINA:
-            break
+    resultados = []
 
-        if total_paginas is not None and pagina >= total_paginas:
-            break
+    # Processa página 1.
+    for item in itens_primeira:
+        if item_eh_compativel(item):
+            resultados.append(item)
 
-        pagina += 1
+    print(
+        f"Página 1 concluída. "
+        f"Compatíveis encontrados: {len(resultados)}"
+    )
 
-        if PAUSA_ENTRE_PAGINAS:
-            time.sleep(PAUSA_ENTRE_PAGINAS)
+    # --------------------------------------------------------
+    # 2. Consulta as demais páginas em paralelo
+    # --------------------------------------------------------
 
-    return publicacoes_encontradas
+    if total_paginas > 1:
+        print()
+        print(
+            f"Consultando páginas 2 a {total_paginas} "
+            f"com até {MAX_WORKERS} requisições simultâneas..."
+        )
+        print()
+
+        concluidas = 1
+
+        with ThreadPoolExecutor(
+            max_workers=MAX_WORKERS
+        ) as executor:
+
+            futuros = {
+                executor.submit(
+                    consultar_pagina,
+                    pagina,
+                    hoje,
+                ): pagina
+                for pagina in range(2, total_paginas + 1)
+            }
+
+            for futuro in as_completed(futuros):
+                pagina = futuros[futuro]
+
+                try:
+                    pagina_retornada, _, itens = futuro.result()
+
+                except Exception as erro:
+                    # Uma página que continua falhando depois de todos
+                    # os retries deve derrubar a execução, pois em um
+                    # monitor jurídico não queremos fingir que a consulta
+                    # foi completa.
+                    raise RuntimeError(
+                        f"Falha definitiva na página {pagina}: {erro}"
+                    ) from erro
+
+                for item in itens:
+                    if item_eh_compativel(item):
+                        resultados.append(item)
+
+                concluidas += 1
+
+                # Mostra progresso sem imprimir 895 blocos enormes.
+                if (
+                    concluidas % 25 == 0
+                    or concluidas == total_paginas
+                ):
+                    percentual = (
+                        concluidas / total_paginas
+                    ) * 100
+
+                    print(
+                        f"Progresso: {concluidas}/{total_paginas} páginas "
+                        f"({percentual:.1f}%) | "
+                        f"compatíveis brutos: {len(resultados)}"
+                    )
+
+    # --------------------------------------------------------
+    # 3. Remove duplicidades
+    # --------------------------------------------------------
+
+    unicos = {}
+    for item in resultados:
+        chave = chave_unica(item)
+
+        if chave not in unicos:
+            unicos[chave] = item
+
+    publicacoes_unicas = list(unicos.values())
+
+    # Ordena por órgão e número do processo para facilitar leitura.
+    publicacoes_unicas.sort(
+        key=lambda item: (
+            normalizar(item.get("nomeOrgao", "")),
+            obter_numero_processo(item),
+        )
+    )
+
+    print()
+    print(
+        f"Compatíveis antes da remoção de duplicidades: "
+        f"{len(resultados)}"
+    )
+    print(
+        f"Publicações únicas após deduplicação: "
+        f"{len(publicacoes_unicas)}"
+    )
+
+    return publicacoes_unicas
 
 
 # ============================================================
-# EXIBIÇÃO DO RESULTADO
+# EXIBIÇÃO FINAL
 # ============================================================
 
 def exibir_resultados(publicacoes):
@@ -296,19 +431,21 @@ def exibir_resultados(publicacoes):
 
     if not publicacoes:
         print()
-        print("Nenhuma publicação correspondente aos filtros foi encontrada.")
+        print(
+            "Nenhuma publicação correspondente aos filtros "
+            "foi encontrada."
+        )
         print("=" * 70)
         return
 
     for indice, item in enumerate(publicacoes, start=1):
         processo = obter_numero_processo(item)
         orgao = item.get("nomeOrgao", "Não informado")
-        data = (
-            item.get("dataDisponibilizacao")
-            or item.get("datadisponibilizacao")
-            or "Não informada"
+        data = obter_data(item)
+        tipo = item.get(
+            "tipoComunicacao",
+            "Não informado",
         )
-        tipo = item.get("tipoComunicacao", "Não informado")
         link = item.get("link", "")
         texto = item.get("texto", "")
 
@@ -344,5 +481,6 @@ if __name__ == "__main__":
         print(str(erro))
         print("=" * 70)
 
-        # Faz o GitHub Actions marcar a execução como erro.
+        # Mantém o GitHub Actions como erro quando a consulta
+        # não tiver sido concluída corretamente.
         raise
