@@ -239,28 +239,111 @@ def obter_meio(item):
     return candidatos[0] if candidatos else "Não informado pela API"
 
 
+def _lista_direta(item, nomes):
+    """Procura listas somente nas chaves conhecidas da API."""
+    for nome in nomes:
+        valor = item.get(nome)
+        if isinstance(valor, list):
+            return valor
+    return []
+
+
+def _valor_texto(objeto, *chaves):
+    if not isinstance(objeto, dict):
+        return ""
+
+    for chave in chaves:
+        valor = objeto.get(chave)
+        if valor is not None and str(valor).strip():
+            return str(valor).strip()
+
+    return ""
+
+
 def obter_partes(item):
-    candidatos = procurar_campos(
+    """Somente nome e polo, sem IDs/metadados internos."""
+    registros = _lista_direta(
         item,
-        ["parte", "destinatario"]
+        ("destinatarios", "partes", "parte", "destinatario"),
     )
 
-    # Evita mostrar campos evidentemente ligados a advogado nesta seção.
-    filtrados = [
-        valor for valor in candidatos
-        if "advog" not in normalizar(valor)
-    ]
+    resultado = []
+    vistos = set()
 
-    return filtrados if filtrados else ["Não informado pela API"]
+    for registro in registros:
+        if not isinstance(registro, dict):
+            continue
+
+        nome = _valor_texto(registro, "nome", "nomeParte", "nome_parte")
+        polo = _valor_texto(registro, "polo", "tipoPolo", "tipo_polo")
+
+        if not nome:
+            continue
+
+        chave = (normalizar(nome), normalizar(polo))
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+        resultado.append(f"{nome} — Polo {polo}" if polo else nome)
+
+    return resultado if resultado else ["Não informado pela API"]
 
 
 def obter_advogados(item):
-    candidatos = procurar_campos(
+    """Somente nome e OAB/UF, sem IDs, datas ou duplicidades."""
+    registros = _lista_direta(
         item,
-        ["advog"]
+        (
+            "destinatarioadvogados",
+            "destinatarioAdvogados",
+            "advogados",
+            "advogado",
+        ),
     )
 
-    return candidatos if candidatos else ["Não informado pela API"]
+    resultado = []
+    vistos = set()
+
+    for registro in registros:
+        if not isinstance(registro, dict):
+            continue
+
+        cadastro = registro.get("advogado")
+        if not isinstance(cadastro, dict):
+            cadastro = registro
+
+        nome = _valor_texto(
+            cadastro, "nome", "nomeAdvogado", "nome_advogado"
+        )
+        numero_oab = _valor_texto(
+            cadastro, "numero_oab", "numeroOab", "oab"
+        )
+        uf_oab = _valor_texto(
+            cadastro, "uf_oab", "ufOab", "uf"
+        )
+
+        if not nome:
+            continue
+
+        chave = (
+            normalizar(nome),
+            normalizar(numero_oab),
+            normalizar(uf_oab),
+        )
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+
+        if numero_oab and uf_oab:
+            resultado.append(f"{nome} — OAB/{uf_oab} {numero_oab}")
+        elif numero_oab:
+            resultado.append(f"{nome} — OAB {numero_oab}")
+        else:
+            resultado.append(nome)
+
+    return resultado if resultado else ["Não informado pela API"]
 
 
 # ============================================================
