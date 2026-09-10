@@ -2,6 +2,7 @@ import os
 import requests
 import unicodedata
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # CONFIGURAÇÕES
@@ -69,7 +70,11 @@ def contem_distribuido(texto):
 # ============================================================
 
 def consultar_publicacoes():
-    hoje = datetime.now().strftime("%Y-%m-%d")
+    from zoneinfo import ZoneInfo
+
+    hoje = datetime.now(
+        ZoneInfo("America/Sao_Paulo")
+    ).strftime("%Y-%m-%d")
 
     pagina = 1
     resultados = []
