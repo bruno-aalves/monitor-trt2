@@ -2,17 +2,31 @@ name: Monitor PJe
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "0 10 * * 1-5"
+    # UTC: 07h17, 08h47 e 10h17 no horário de Brasília (UTC-3)
+    # Todos os dias, inclusive sábados, domingos e feriados.
+    - cron: "17 10 * * *"
+    - cron: "47 11 * * *"
+    - cron: "17 13 * * *"
+
+permissions:
+  contents: write
+
+# Impede duas execuções simultâneas do mesmo monitor.
+concurrency:
+  group: monitor-trt2-diario
+  cancel-in-progress: false
 
 jobs:
   monitorar:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
 
     steps:
       - name: Baixar repositório
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -22,16 +36,69 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: Executar monitor
+      - name: Executar monitor e enviar relatório
         env:
           PJE_API_URL: ${{ secrets.PJE_API_URL }}
-
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USUARIO: ${{ secrets.SMTP_USUARIO }}
           SMTP_SENHA: ${{ secrets.SMTP_SENHA }}
-
           EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
           EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
-
         run: python monitor.py
+
+      - name: Registrar data do envio no repositório
+        run: |
+          if [ ! -f .monitor-state/last_success.json ]; then
+            echo "Nenhum marcador novo: relatório já havia sido enviado."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .monitor-state/last_success.json
+          if git diff --cached --quiet; then
+            echo "Estado já registrado."
+            exit 0
+          fi
+          git commit -m "chore: registrar relatório diário do TRT2 [skip ci]"
+          git push
+
+      - name: Alertar por e-mail se a execução falhar
+        if: failure()
+        continue-on-error: true
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USUARIO: ${{ secrets.SMTP_USUARIO }}
+          SMTP_SENHA: ${{ secrets.SMTP_SENHA }}
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import os, smtplib
+          from email.message import EmailMessage
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          required = ("SMTP_HOST", "SMTP_USUARIO", "SMTP_SENHA", "EMAIL_DESTINATARIO")
+          if any(not os.getenv(key) for key in required):
+              print("Alerta não enviado: secrets SMTP incompletos.")
+              raise SystemExit(0)
+          data = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y")
+          msg = EmailMessage()
+          msg["Subject"] = f"ALERTA: Monitor TRT2 falhou - {data}"
+          msg["From"] = os.getenv("EMAIL_REMETENTE") or os.environ["SMTP_USUARIO"]
+          msg["To"] = os.environ["EMAIL_DESTINATARIO"]
+          msg.set_content(
+              f"O monitor TRT2 teve uma falha técnica em {data}.\\n"
+              "Não é possível concluir que houve zero publicações.\\n"
+              f"Consulte o log: {os.environ['RUN_URL']}\\n"
+          )
+          with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.getenv("SMTP_PORT") or "587"), timeout=60) as smtp:
+              smtp.ehlo()
+              smtp.starttls()
+              smtp.ehlo()
+              smtp.login(os.environ["SMTP_USUARIO"], os.environ["SMTP_SENHA"])
+              smtp.send_message(msg)
+          print("Alerta de falha enviado.")
+          PY
