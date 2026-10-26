@@ -4,6 +4,10 @@ import time
 import math
 import html
 import smtplib
+import json
+import random
+import threading
+from pathlib import Path
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -33,8 +37,13 @@ VARAS_ALVO = [
 ]
 
 # Mantemos 5 para equilibrar velocidade e reduzir HTTP 429.
-MAX_WORKERS = 5
-MAX_TENTATIVAS = 8
+MAX_WORKERS = 2
+MAX_TENTATIVAS = 4
+INTERVALO_REQUISICOES = 2.5  # segundos entre inícios de chamadas, globalmente
+PAUSAS_RECUPERACAO = (60, 180, 300)  # novas rodadas só para páginas falhadas
+ARQUIVO_ESTADO = Path(".monitor-state/last_success.json")
+_controle_intervalo = threading.Lock()
+_proxima_requisicao = 0.0
 
 
 # ============================================================
@@ -350,81 +359,90 @@ def obter_advogados(item):
 # REQUISIÇÕES COM RETRY
 # ============================================================
 
+def respeitar_intervalo():
+    """Limita o ritmo global, mesmo usando duas threads."""
+    global _proxima_requisicao
+    with _controle_intervalo:
+        agora = time.monotonic()
+        espera = max(0, _proxima_requisicao - agora)
+        if espera:
+            time.sleep(espera)
+        _proxima_requisicao = time.monotonic() + INTERVALO_REQUISICOES
+
+
 def fazer_requisicao(parametros):
     ultimo_erro = None
+    pagina = parametros.get("pagina")
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
+            respeitar_intervalo()
             resposta = requests.get(
                 API_URL,
                 params=parametros,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "monitor-trt2/1.0",
+                    "User-Agent": "monitor-trt2/2.0",
                 },
                 timeout=90,
             )
 
             if resposta.status_code == 403:
                 raise RuntimeError(
-                    "Comunica PJe retornou HTTP 403. "
-                    "Verifique o Secret PJE_API_URL e o proxy brasileiro."
+                    "HTTP 403: verifique PJE_API_URL e o proxy brasileiro."
                 )
 
             if resposta.status_code in (429, 500, 502, 503, 504):
-                ultimo_erro = RuntimeError(
-                    f"HTTP {resposta.status_code}"
-                )
-
+                ultimo_erro = RuntimeError(f"HTTP {resposta.status_code}")
                 if tentativa < MAX_TENTATIVAS:
-                    espera = min(3 * tentativa, 20)
-
-                    print(
-                        f"⚠️ Página {parametros.get('pagina')} retornou "
-                        f"HTTP {resposta.status_code}. "
-                        f"Tentativa {tentativa}/{MAX_TENTATIVAS}. "
-                        f"Nova tentativa em {espera}s."
+                    # 429: pausa maior; 5xx: backoff progressivo.
+                    espera = (
+                        min(30 * tentativa, 90)
+                        if resposta.status_code == 429
+                        else min(8 * 2 ** (tentativa - 1), 60)
                     )
-
+                    espera += random.uniform(0, 3)
+                    print(
+                        f"⚠️ Página {pagina}: HTTP {resposta.status_code}, "
+                        f"tentativa {tentativa}/{MAX_TENTATIVAS}; "
+                        f"nova tentativa em {espera:.0f}s.",
+                        flush=True,
+                    )
                     time.sleep(espera)
                     continue
 
             resposta.raise_for_status()
-
             try:
-                return resposta.json()
-
+                dados = resposta.json()
             except ValueError as erro_json:
                 raise RuntimeError(
-                    "A API respondeu, mas não retornou JSON válido."
+                    f"Página {pagina}: resposta não é JSON válido."
                 ) from erro_json
-
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ) as erro:
-            ultimo_erro = erro
-
-            if tentativa < MAX_TENTATIVAS:
-                espera = min(3 * tentativa, 20)
-
-                print(
-                    f"⚠️ Falha de conexão na página "
-                    f"{parametros.get('pagina')}. "
-                    f"Tentativa {tentativa}/{MAX_TENTATIVAS}. "
-                    f"Nova tentativa em {espera}s."
+            if not isinstance(dados, dict):
+                raise RuntimeError(
+                    f"Página {pagina}: estrutura inesperada (não é objeto JSON)."
                 )
+            return dados
 
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as erro:
+            ultimo_erro = erro
+            if tentativa < MAX_TENTATIVAS:
+                espera = min(8 * 2 ** (tentativa - 1), 60)
+                print(
+                    f"⚠️ Página {pagina}: falha de conexão "
+                    f"({tentativa}/{MAX_TENTATIVAS}); aguardando {espera}s.",
+                    flush=True,
+                )
                 time.sleep(espera)
                 continue
-
         except requests.exceptions.RequestException as erro:
             ultimo_erro = erro
             break
 
     raise RuntimeError(
-        f"Página {parametros.get('pagina')} falhou após "
-        f"{MAX_TENTATIVAS} tentativas. Último erro: {ultimo_erro}"
+        f"Página {pagina} falhou após {MAX_TENTATIVAS} tentativas. "
+        f"Último erro: {ultimo_erro}"
     )
 
 
@@ -499,58 +517,64 @@ def consultar_publicacoes():
     )
 
     if total_paginas > 1:
-        print()
-        print(
-            f"Consultando páginas 2 a {total_paginas} "
-            f"com até {MAX_WORKERS} requisições simultâneas..."
-        )
-        print()
-
+        paginas_pendentes = list(range(2, total_paginas + 1))
         concluidas = 1
+        erros_finais = {}
 
-        with ThreadPoolExecutor(
-            max_workers=MAX_WORKERS
-        ) as executor:
+        # Primeira rodada completa; depois, só as páginas com erro.
+        for rodada in range(len(PAUSAS_RECUPERACAO) + 1):
+            if not paginas_pendentes:
+                break
+            if rodada:
+                pausa = PAUSAS_RECUPERACAO[rodada - 1]
+                print(
+                    f"🔄 Recuperação {rodada}/{len(PAUSAS_RECUPERACAO)}: "
+                    f"{len(paginas_pendentes)} página(s). "
+                    f"Aguardando {pausa}s.",
+                    flush=True,
+                )
+                time.sleep(pausa)
 
-            futuros = {
-                executor.submit(
-                    consultar_pagina,
-                    pagina,
-                    hoje,
-                ): pagina
-                for pagina in range(2, total_paginas + 1)
-            }
+            falhadas = []
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futuros = {
+                    executor.submit(consultar_pagina, pagina, hoje): pagina
+                    for pagina in paginas_pendentes
+                }
+                for futuro in as_completed(futuros):
+                    pagina = futuros[futuro]
+                    try:
+                        _, _, itens = futuro.result()
+                    except Exception as erro:
+                        erros_finais[pagina] = str(erro)
+                        falhadas.append(pagina)
+                        print(f"⚠️ Página {pagina} pendente: {erro}", flush=True)
+                        continue
 
-            for futuro in as_completed(futuros):
-                pagina = futuros[futuro]
+                    erros_finais.pop(pagina, None)
+                    for item in itens:
+                        if item_eh_compativel(item):
+                            resultados.append(item)
+                    concluidas += 1
+                    if concluidas % 25 == 0 or concluidas == total_paginas:
+                        print(
+                            f"Progresso: {concluidas}/{total_paginas} páginas "
+                            f"({100 * concluidas / total_paginas:.1f}%) | "
+                            f"compatíveis brutos: {len(resultados)}",
+                            flush=True,
+                        )
+            paginas_pendentes = sorted(falhadas)
 
-                try:
-                    _, _, itens = futuro.result()
-
-                except Exception as erro:
-                    raise RuntimeError(
-                        f"Falha definitiva na página {pagina}: {erro}"
-                    ) from erro
-
-                for item in itens:
-                    if item_eh_compativel(item):
-                        resultados.append(item)
-
-                concluidas += 1
-
-                if (
-                    concluidas % 25 == 0
-                    or concluidas == total_paginas
-                ):
-                    percentual = (
-                        concluidas / total_paginas
-                    ) * 100
-
-                    print(
-                        f"Progresso: {concluidas}/{total_paginas} páginas "
-                        f"({percentual:.1f}%) | "
-                        f"compatíveis brutos: {len(resultados)}"
-                    )
+        if paginas_pendentes:
+            detalhes = "; ".join(
+                f"{pagina}: {erros_finais[pagina]}"
+                for pagina in paginas_pendentes[:10]
+            )
+            raise RuntimeError(
+                f"Consulta incompleta: {len(paginas_pendentes)} de "
+                f"{total_paginas} páginas falharam após recuperação. "
+                f"Páginas: {paginas_pendentes}. Detalhes: {detalhes}"
+            )
 
     unicos = {}
     for item in resultados:
@@ -828,17 +852,48 @@ def enviar_email(publicacoes, hoje):
 # EXECUÇÃO
 # ============================================================
 
-if __name__ == "__main__":
+def data_ja_enviada(hoje):
+    """Controle persistente versionado no repositório pelo workflow."""
+    if not ARQUIVO_ESTADO.exists():
+        return False
     try:
-        publicacoes, hoje = consultar_publicacoes()
-        exibir_resultados(publicacoes)
-        enviar_email(publicacoes, hoje)
+        estado = json.loads(ARQUIVO_ESTADO.read_text(encoding="utf-8"))
+        return estado.get("data") == hoje
+    except (ValueError, OSError):
+        return False
 
-    except Exception as erro:
-        print()
-        print("=" * 70)
-        print("❌ ERRO NO MONITOR")
-        print("=" * 70)
-        print(str(erro))
-        print("=" * 70)
-        raise
+
+def registrar_envio(hoje, quantidade):
+    """Grava marcador somente depois de SMTP aceitar a mensagem."""
+    ARQUIVO_ESTADO.parent.mkdir(parents=True, exist_ok=True)
+    estado = {
+        "data": hoje,
+        "quantidade": quantidade,
+        "enviado_em": datetime.now(
+            ZoneInfo("America/Sao_Paulo")
+        ).isoformat(),
+    }
+    ARQUIVO_ESTADO.write_text(
+        json.dumps(estado, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d")
+    if data_ja_enviada(hoje):
+        print(f"✅ Relatório de {hoje} já enviado; não enviar novamente.")
+    else:
+        try:
+            publicacoes, data = consultar_publicacoes()
+            exibir_resultados(publicacoes)
+            enviar_email(publicacoes, data)  # Também envia quando len == 0
+            registrar_envio(data, len(publicacoes))
+        except Exception as erro:
+            print()
+            print("=" * 70)
+            print("❌ ERRO NO MONITOR — NÃO CONFUNDIR COM ZERO PUBLICAÇÕES")
+            print("=" * 70)
+            print(str(erro))
+            print("=" * 70)
+            raise
