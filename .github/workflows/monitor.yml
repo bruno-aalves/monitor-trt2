@@ -3,16 +3,14 @@ name: Monitor PJe
 on:
   workflow_dispatch:
   schedule:
-    # UTC: 07h17, 08h47 e 10h17 no horário de Brasília (UTC-3)
-    # Todos os dias, inclusive sábados, domingos e feriados.
-    - cron: "17 10 * * *"
-    - cron: "47 11 * * *"
-    - cron: "17 13 * * *"
+    # UTC -> Brasília: 07h00, 08h30, 10h00; TODOS os dias
+    - cron: "0 10 * * *"
+    - cron: "30 11 * * *"
+    - cron: "0 13 * * *"
 
 permissions:
   contents: write
 
-# Impede duas execuções simultâneas do mesmo monitor.
 concurrency:
   group: monitor-trt2-diario
   cancel-in-progress: false
@@ -21,12 +19,18 @@ jobs:
   monitorar:
     runs-on: ubuntu-latest
     timeout-minutes: 240
-
     steps:
       - name: Baixar repositório
         uses: actions/checkout@v4
         with:
+          ref: main
           persist-credentials: true
+
+      - name: Atualizar registro antes de verificar duplicidade
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -37,6 +41,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Executar monitor e enviar relatório
+        id: consulta
         env:
           PJE_API_URL: ${{ secrets.PJE_API_URL }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -47,24 +52,36 @@ jobs:
           EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
         run: python monitor.py
 
-      - name: Registrar data do envio no repositório
+      - name: Salvar registro de envio no GitHub
+        if: steps.consulta.outcome == 'success'
         run: |
-          if [ ! -f .monitor-state/last_success.json ]; then
-            echo "Nenhum marcador novo: relatório já havia sido enviado."
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .monitor-state/last_success.json
           if git diff --cached --quiet; then
-            echo "Estado já registrado."
+            echo "Nenhuma mudança no registro; relatório já registrado."
             exit 0
           fi
-          git commit -m "chore: registrar relatório diário do TRT2 [skip ci]"
-          git push
+          git commit -m "chore: registrar relatório diário TRT2 [skip ci]"
+          # Atualizações paralelas independentes não devem bloquear o registro.
+          for tentativa in 1 2 3; do
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Conflito no registro; exige verificação manual."
+              exit 1
+            fi
+            if git push origin HEAD:main; then
+              echo "Registro salvo no GitHub."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERRO: e-mail pode ter sido enviado, mas o registro não foi salvo."
+          exit 1
 
-      - name: Alertar por e-mail se a execução falhar
-        if: failure()
+      - name: Alertar falha da consulta ou do envio de e-mail
+        if: always() && steps.consulta.outcome == 'failure'
         continue-on-error: true
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -75,24 +92,24 @@ jobs:
           EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python - <<'PY'
+          python - <<'PYCODE'
           import os, smtplib
-          from email.message import EmailMessage
           from datetime import datetime
+          from email.message import EmailMessage
           from zoneinfo import ZoneInfo
           required = ("SMTP_HOST", "SMTP_USUARIO", "SMTP_SENHA", "EMAIL_DESTINATARIO")
-          if any(not os.getenv(key) for key in required):
-              print("Alerta não enviado: secrets SMTP incompletos.")
-              raise SystemExit(0)
+          if any(not os.getenv(k) for k in required):
+              raise SystemExit("Secrets de e-mail incompletos; alerta não enviado.")
           data = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y")
           msg = EmailMessage()
-          msg["Subject"] = f"ALERTA: Monitor TRT2 falhou - {data}"
+          msg["Subject"] = f"ALERTA: Monitor TRT2 falhou na consulta - {data}"
           msg["From"] = os.getenv("EMAIL_REMETENTE") or os.environ["SMTP_USUARIO"]
           msg["To"] = os.environ["EMAIL_DESTINATARIO"]
           msg.set_content(
-              f"O monitor TRT2 teve uma falha técnica em {data}.\\n"
-              "Não é possível concluir que houve zero publicações.\\n"
-              f"Consulte o log: {os.environ['RUN_URL']}\\n"
+              "O monitor não concluiu a consulta ou o envio de e-mail. "
+              "Não interprete como zero publicações. "
+              "Confira se houve envio antes de executar novamente.\n"
+              f"Log: {os.environ['RUN_URL']}\n"
           )
           with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.getenv("SMTP_PORT") or "587"), timeout=60) as smtp:
               smtp.ehlo()
@@ -100,5 +117,4 @@ jobs:
               smtp.ehlo()
               smtp.login(os.environ["SMTP_USUARIO"], os.environ["SMTP_SENHA"])
               smtp.send_message(msg)
-          print("Alerta de falha enviado.")
-          PY
+          PYCODE
